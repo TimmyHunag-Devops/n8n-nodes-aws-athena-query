@@ -10,6 +10,11 @@ import { createHash, createHmac } from 'crypto';
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// AWS metadata service constants
+const ECS_METADATA_URI = 'http://169.254.170.2';
+const EC2_METADATA_URI = 'http://169.254.169.254';
+const METADATA_REQUEST_TIMEOUT = 1000;
+
 // AWS Signature V4 implementation
 class AWSSignatureV4 {
 	private accessKeyId: string;
@@ -214,24 +219,203 @@ async function makeAthenaRequest(
 			responseBody,
 			requestHeaders: signedHeaders,
 			originalError: error.message,
-			errorType: error.constructor.name
+			errorType: error.constructor.name,
 		};
 
 		if (error.response) {
 			// This is an API error from AWS - use NodeApiError
-			throw new NodeApiError(
-				executeFunctions.getNode(),
-				error,
-				{ message: `${errorMessage}\nDebug Info: ${JSON.stringify(debugInfo, null, 2)}` }
-			);
+			throw new NodeApiError(executeFunctions.getNode(), error, {
+				message: `${errorMessage}\nDebug Info: ${JSON.stringify(debugInfo, null, 2)}`,
+			});
 		} else {
 			// This is a general operation error - use NodeOperationError
 			throw new NodeOperationError(
 				executeFunctions.getNode(),
-				`${errorMessage}\nDebug Info: ${JSON.stringify(debugInfo, null, 2)}`
+				`${errorMessage}\nDebug Info: ${JSON.stringify(debugInfo, null, 2)}`,
 			);
 		}
 	}
+}
+
+/**
+ * Get temporary credentials from AWS environment (EC2/ECS/EKS)
+ */
+async function getSystemCredentials(
+	executeFunctions: IExecuteFunctions,
+): Promise<{ accessKeyId: string; secretAccessKey: string; sessionToken: string }> {
+	try {
+		// Try ECS Task Metadata Service first
+		const ecsUri = process.env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI;
+		if (ecsUri) {
+			const response = (await executeFunctions.helpers.httpRequest({
+				method: 'GET',
+				url: `${ECS_METADATA_URI}${ecsUri}`,
+				timeout: METADATA_REQUEST_TIMEOUT,
+				json: true,
+			})) as any;
+
+			return {
+				accessKeyId: response.AccessKeyId,
+				secretAccessKey: response.SecretAccessKey,
+				sessionToken: response.Token,
+			};
+		}
+
+		// Try EC2 Instance Metadata Service v2 (IMDSv2)
+		const token = (await executeFunctions.helpers.httpRequest({
+			method: 'PUT',
+			url: `${EC2_METADATA_URI}/latest/api/token`,
+			headers: { 'X-aws-ec2-metadata-token-ttl-seconds': '21600' },
+			timeout: METADATA_REQUEST_TIMEOUT,
+		})) as string;
+
+		const roleName = (await executeFunctions.helpers.httpRequest({
+			method: 'GET',
+			url: `${EC2_METADATA_URI}/latest/meta-data/iam/security-credentials/`,
+			headers: { 'X-aws-ec2-metadata-token': token },
+			timeout: METADATA_REQUEST_TIMEOUT,
+		})) as string;
+
+		const credentials = (await executeFunctions.helpers.httpRequest({
+			method: 'GET',
+			url: `${EC2_METADATA_URI}/latest/meta-data/iam/security-credentials/${roleName.trim()}`,
+			headers: { 'X-aws-ec2-metadata-token': token },
+			timeout: METADATA_REQUEST_TIMEOUT,
+			json: true,
+		})) as any;
+
+		return {
+			accessKeyId: credentials.AccessKeyId,
+			secretAccessKey: credentials.SecretAccessKey,
+			sessionToken: credentials.Token,
+		};
+	} catch (error: any) {
+		throw new NodeOperationError(
+			executeFunctions.getNode(),
+			`Failed to retrieve system credentials: ${error.message}. ` +
+				'Ensure n8n is running in AWS (EC2/ECS/EKS) with an IAM role attached.',
+		);
+	}
+}
+
+/**
+ * Call STS AssumeRole API to get temporary credentials
+ */
+async function callStsAssumeRole(
+	executeFunctions: IExecuteFunctions,
+	stsAccessKeyId: string,
+	stsSecretAccessKey: string,
+	stsSessionToken: string | undefined,
+	roleArn: string,
+	externalId: string,
+	roleSessionName: string,
+	region: string,
+): Promise<{ accessKeyId: string; secretAccessKey: string; sessionToken: string }> {
+	const params = new URLSearchParams({
+		Action: 'AssumeRole',
+		Version: '2011-06-15',
+		RoleArn: roleArn,
+		RoleSessionName: roleSessionName,
+	});
+
+	if (externalId?.trim()) {
+		params.append('ExternalId', externalId);
+	}
+
+	const domain = region.startsWith('cn-') ? 'amazonaws.com.cn' : 'amazonaws.com';
+	const stsEndpoint = `https://sts.${region}.${domain}/`;
+	const payload = params.toString();
+
+	const stsSigner = new AWSSignatureV4(
+		stsAccessKeyId,
+		stsSecretAccessKey,
+		region,
+		'sts',
+		stsSessionToken,
+	);
+
+	const signedHeaders = stsSigner.sign(
+		'POST',
+		stsEndpoint,
+		{
+			'Content-Type': 'application/x-www-form-urlencoded',
+			Host: `sts.${region}.${domain}`,
+		},
+		payload,
+	);
+
+	try {
+		const response = (await executeFunctions.helpers.httpRequest({
+			method: 'POST',
+			url: stsEndpoint,
+			headers: signedHeaders,
+			body: payload,
+		})) as any;
+
+		const credentials = response.AssumeRoleResponse?.AssumeRoleResult?.Credentials;
+
+		if (!credentials?.AccessKeyId || !credentials?.SecretAccessKey || !credentials?.SessionToken) {
+			throw new Error('Invalid STS response: missing credentials');
+		}
+
+		return {
+			accessKeyId: credentials.AccessKeyId,
+			secretAccessKey: credentials.SecretAccessKey,
+			sessionToken: credentials.SessionToken,
+		};
+	} catch (error: any) {
+		const awsError =
+			error.response?.body?.ErrorResponse?.Error || error.response?.data?.ErrorResponse?.Error;
+		const errorMessage = awsError
+			? `${awsError.Code}: ${awsError.Message}`
+			: error.message || 'Unknown error';
+
+		throw new NodeOperationError(
+			executeFunctions.getNode(),
+			`STS AssumeRole failed: ${errorMessage}`,
+		);
+	}
+}
+
+/**
+ * Get AWS credentials based on the authentication method selected in node parameters
+ */
+async function getAwsCredentials(
+	executeFunctions: IExecuteFunctions,
+	authMethod: string,
+	region: string,
+): Promise<{ accessKeyId: string; secretAccessKey: string; sessionToken?: string }> {
+	if (authMethod === 'standardCredentials') {
+		// Use standard AWS credentials
+		const creds = await executeFunctions.getCredentials('aws');
+		return {
+			accessKeyId: creds.accessKeyId as string,
+			secretAccessKey: creds.secretAccessKey as string,
+			sessionToken: creds.sessionToken as string | undefined,
+		};
+	}
+
+	// Use AssumeRole to get temporary credentials
+	const creds = await executeFunctions.getCredentials('awsAssumeRole');
+
+	const { accessKeyId, secretAccessKey, sessionToken } = creds.useSystemCredentialsForRole
+		? await getSystemCredentials(executeFunctions)
+		: {
+				accessKeyId: creds.stsAccessKeyId as string,
+				secretAccessKey: creds.stsSecretAccessKey as string,
+				sessionToken: creds.stsSessionToken as string | undefined,
+			};
+
+	return await callStsAssumeRole(
+		executeFunctions,
+		accessKeyId,
+		secretAccessKey,
+		sessionToken,
+		creds.roleArn as string,
+		(creds.externalId as string) || '',
+		(creds.roleSessionName as string) || 'n8n-athena',
+		region,
+	);
 }
 
 export class AwsAthenaQuery implements INodeType {
@@ -252,9 +436,41 @@ export class AwsAthenaQuery implements INodeType {
 			{
 				name: 'aws',
 				required: true,
+				displayOptions: {
+					show: {
+						authMethod: ['standardCredentials'],
+					},
+				},
+			},
+			{
+				name: 'awsAssumeRole',
+				required: true,
+				displayOptions: {
+					show: {
+						authMethod: ['assumeRole'],
+					},
+				},
 			},
 		],
 		properties: [
+			{
+				displayName: 'Authentication Method',
+				name: 'authMethod',
+				type: 'options',
+				options: [
+					{
+						name: 'Standard Credentials',
+						value: 'standardCredentials',
+						description: 'Use AWS IAM Access Key and Secret Key',
+					},
+					{
+						name: 'AssumeRole',
+						value: 'assumeRole',
+						description: 'Use STS AssumeRole for temporary credentials',
+					},
+				],
+				default: 'assumeRole',
+			},
 			{
 				displayName: 'Region',
 				name: 'region',
@@ -325,34 +541,42 @@ export class AwsAthenaQuery implements INodeType {
 				description: 'How to structure the query results for use in your workflow',
 				required: true,
 			},
-				{
-					displayName: 'Max Rows Returned',
-					name: 'maxRowsMode',
-					type: 'options',
-					options: [
-						{ name: 'No Limit', value: 'noLimit', description: 'Return all available rows (Warning: May be slow)' },
-						{ name: 'Limit Applied', value: 'limitApplied', description: 'Return up to a maximum number of rows' },
-					],
-					default: 'noLimit',
-					description: 'Control how many rows are returned from the query',
-					required: true,
-				},
-				{
-					displayName: 'Max Rows',
-					name: 'maxRows',
-					type: 'number',
-					default: 10000,
-					description: 'Maximum number of rows to return when limit is applied',
-					required: true,
-					displayOptions: {
-						show: {
-							maxRowsMode: ['limitApplied'],
-						},
+			{
+				displayName: 'Max Rows Returned',
+				name: 'maxRowsMode',
+				type: 'options',
+				options: [
+					{
+						name: 'No Limit',
+						value: 'noLimit',
+						description: 'Return all available rows (Warning: May be slow)',
 					},
-					typeOptions: {
-						minValue: 1,
+					{
+						name: 'Limit Applied',
+						value: 'limitApplied',
+						description: 'Return up to a maximum number of rows',
+					},
+				],
+				default: 'noLimit',
+				description: 'Control how many rows are returned from the query',
+				required: true,
+			},
+			{
+				displayName: 'Max Rows',
+				name: 'maxRows',
+				type: 'number',
+				default: 10000,
+				description: 'Maximum number of rows to return when limit is applied',
+				required: true,
+				displayOptions: {
+					show: {
+						maxRowsMode: ['limitApplied'],
 					},
 				},
+				typeOptions: {
+					minValue: 1,
+				},
+			},
 		],
 	};
 
@@ -363,6 +587,7 @@ export class AwsAthenaQuery implements INodeType {
 		for (let itemIndex = 0; itemIndex < items.length; itemIndex++) {
 			try {
 				// Get node parameters
+				const authMethod = this.getNodeParameter('authMethod', itemIndex) as string;
 				const region = this.getNodeParameter('region', itemIndex) as string;
 				const database = this.getNodeParameter('database', itemIndex) as string;
 				const query = this.getNodeParameter('query', itemIndex) as string;
@@ -388,19 +613,13 @@ export class AwsAthenaQuery implements INodeType {
 					throw new NodeOperationError(this.getNode(), 'Timeout must be greater than 0.');
 				}
 
-				// Get AWS credentials
-				const credentials = await this.getCredentials('aws');
-
-				if (!credentials.accessKeyId || !credentials.secretAccessKey) {
-					throw new NodeOperationError(
-						this.getNode(),
-						'Invalid AWS credentials. Please ensure they are configured correctly.',
-					);
-				}
+				// Get AWS credentials based on selected authentication method
+				const credentials = await getAwsCredentials(this, authMethod, region);
 
 				// Generate a unique client request token for idempotency (minimum 32 characters required)
 				const timestamp = Date.now().toString();
-				const randomPart = Math.random().toString(36).substring(2, 17) + Math.random().toString(36).substring(2, 17);
+				const randomPart =
+					Math.random().toString(36).substring(2, 17) + Math.random().toString(36).substring(2, 17);
 				const clientRequestToken = `n8n-${timestamp}-${randomPart}`.substring(0, 64); // Ensure it's at least 32 chars, max 64
 
 				// Prepare query execution parameters
@@ -484,7 +703,11 @@ export class AwsAthenaQuery implements INodeType {
 					}
 
 					// Handle unexpected query states
-					if (queryStatus !== 'RUNNING' && queryStatus !== 'QUEUED' && queryStatus !== 'SUCCEEDED') {
+					if (
+						queryStatus !== 'RUNNING' &&
+						queryStatus !== 'QUEUED' &&
+						queryStatus !== 'SUCCEEDED'
+					) {
 						throw new NodeOperationError(
 							this.getNode(),
 							`Query ended with unexpected status: ${queryStatus}`,
@@ -550,14 +773,17 @@ export class AwsAthenaQuery implements INodeType {
 						});
 
 						parsedResults.push(parsedRow);
-						if (maxRowsMode === 'limitApplied' && (parsedResults.length >= (maxRowsValue as number))) {
+						if (
+							maxRowsMode === 'limitApplied' &&
+							parsedResults.length >= (maxRowsValue as number)
+						) {
 							// Stop collecting more rows; break out after current page
 							break;
 						}
 					}
 
 					// If we've reached the max rows, stop pagination
-					if (maxRowsMode === 'limitApplied' && (parsedResults.length >= (maxRowsValue as number))) {
+					if (maxRowsMode === 'limitApplied' && parsedResults.length >= (maxRowsValue as number)) {
 						nextToken = undefined;
 					} else {
 						nextToken = resultsResponse.NextToken;
