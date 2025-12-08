@@ -1,3 +1,5 @@
+![InDebted](./assets/indebted-logo.svg)
+
 # n8n-nodes-aws-athena-query
 
 This is an n8n community node. It lets you execute SQL queries on AWS Athena in your n8n workflows.
@@ -139,8 +141,7 @@ The node returns results in the following structure:
 ```
 
 ### Advanced Usage Tips
-- **Large Result Sets**: Results are paginated automatically (1000 rows per page, header on first page). Use the new
-  **Max Rows Returned** option to cap total rows without changing your SQL.
+- **Large Result Sets**: Results are paginated automatically (1000 rows per page, header on first page). Use the **Max Rows Returned** option to cap total rows without changing your SQL.
 - **Partitioned Tables**: Use partition predicates to improve query performance
 - **Cost Optimization**: Monitor your query costs in AWS Cost Explorer
 - **Data Types**: All values are returned as strings; use n8n's data transformation features to convert types as needed
