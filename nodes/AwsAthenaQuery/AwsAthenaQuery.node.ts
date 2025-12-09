@@ -3,120 +3,11 @@ import type {
 	INodeExecutionData,
 	INodeType,
 	INodeTypeDescription,
-	IHttpRequestOptions,
 } from 'n8n-workflow';
-import { NodeOperationError, NodeApiError } from 'n8n-workflow';
-import { createHash, createHmac } from 'crypto';
+import { NodeConnectionType, NodeOperationError, NodeApiError } from 'n8n-workflow';
+import { sign } from 'aws4';
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-// AWS metadata service constants
-const ECS_METADATA_URI = 'http://169.254.170.2';
-const EC2_METADATA_URI = 'http://169.254.169.254';
-const METADATA_REQUEST_TIMEOUT = 1000;
-
-// AWS Signature V4 implementation
-class AWSSignatureV4 {
-	private accessKeyId: string;
-	private secretAccessKey: string;
-	private sessionToken?: string;
-	private region: string;
-	private service: string;
-
-	constructor(
-		accessKeyId: string,
-		secretAccessKey: string,
-		region: string,
-		service: string,
-		sessionToken?: string,
-	) {
-		this.accessKeyId = accessKeyId;
-		this.secretAccessKey = secretAccessKey;
-		this.sessionToken = sessionToken;
-		this.region = region;
-		this.service = service;
-	}
-
-	private hash(data: string): string {
-		return createHash('sha256').update(data, 'utf8').digest('hex');
-	}
-
-	private hmac(key: string | Buffer, data: string): Buffer {
-		return createHmac('sha256', key).update(data, 'utf8').digest();
-	}
-
-	private getSignatureKey(dateStamp: string): Buffer {
-		const kDate = this.hmac('AWS4' + this.secretAccessKey, dateStamp);
-		const kRegion = this.hmac(kDate, this.region);
-		const kService = this.hmac(kRegion, this.service);
-		const kSigning = this.hmac(kService, 'aws4_request');
-		return kSigning;
-	}
-
-	sign(
-		method: string,
-		url: string,
-		headers: Record<string, string>,
-		payload: string,
-	): Record<string, string> {
-		const urlObj = new URL(url);
-		const pathname = urlObj.pathname;
-		const querystring = urlObj.search.slice(1);
-
-		const now = new Date();
-		const amzDate = now.toISOString().replace(/[:\-]|\.\d{3}/g, '');
-		const dateStamp = amzDate.slice(0, 8);
-
-		// Canonical headers
-		const signedHeadersNames = Object.keys(headers)
-			.map((key) => key.toLowerCase())
-			.sort()
-			.join(';');
-
-		const canonicalHeaders =
-			Object.keys(headers)
-				.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
-				.map((key) => `${key.toLowerCase()}:${headers[key]}`)
-				.join('\n') + '\n';
-
-		// Canonical request
-		const payloadHash = this.hash(payload);
-		const canonicalRequest = [
-			method,
-			pathname,
-			querystring,
-			canonicalHeaders,
-			signedHeadersNames,
-			payloadHash,
-		].join('\n');
-
-		// String to sign
-		const algorithm = 'AWS4-HMAC-SHA256';
-		const credentialScope = `${dateStamp}/${this.region}/${this.service}/aws4_request`;
-		const stringToSign = [algorithm, amzDate, credentialScope, this.hash(canonicalRequest)].join(
-			'\n',
-		);
-
-		// Calculate signature
-		const signingKey = this.getSignatureKey(dateStamp);
-		const signature = this.hmac(signingKey, stringToSign).toString('hex');
-
-		// Authorization header
-		const authorizationHeader = `${algorithm} Credential=${this.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeadersNames}, Signature=${signature}`;
-
-		const resultHeaders: Record<string, string> = {
-			...headers,
-			Authorization: authorizationHeader,
-			'X-Amz-Date': amzDate,
-		};
-
-		if (this.sessionToken) {
-			resultHeaders['X-Amz-Security-Token'] = this.sessionToken;
-		}
-
-		return resultHeaders;
-	}
-}
 
 // Helper function to make Athena API requests
 async function makeAthenaRequest(
@@ -129,32 +20,35 @@ async function makeAthenaRequest(
 	const endpoint = `https://athena.${region}.amazonaws.com/`;
 	const payloadString = JSON.stringify(payload);
 
-	const headers = {
-		'Content-Type': 'application/x-amz-json-1.1',
-		'X-Amz-Target': target,
-		Host: `athena.${region}.amazonaws.com`,
-	};
-
-	const signer = new AWSSignatureV4(
-		credentials.accessKeyId as string,
-		credentials.secretAccessKey as string,
-		region,
-		'athena',
-		credentials.sessionToken as string | undefined,
-	);
-
-	const signedHeaders = signer.sign('POST', endpoint, headers, payloadString);
-
-	const options: IHttpRequestOptions = {
+	// Construct request options for aws4 signing
+	const requestOptions = {
+		host: `athena.${region}.amazonaws.com`,
 		method: 'POST',
-		url: endpoint,
-		headers: signedHeaders,
+		path: '/',
 		body: payloadString,
-		json: true,
+		region,
+		service: 'athena',
+		headers: {
+			'Content-Type': 'application/x-amz-json-1.1',
+			'X-Amz-Target': target,
+		},
 	};
+
+	// Use aws4 to sign the request
+	sign(requestOptions, {
+		accessKeyId: credentials.accessKeyId,
+		secretAccessKey: credentials.secretAccessKey,
+		sessionToken: credentials.sessionToken,
+	});
 
 	try {
-		const response = await executeFunctions.helpers.httpRequest(options);
+		const response = await executeFunctions.helpers.httpRequest({
+			method: 'POST',
+			url: endpoint,
+			headers: requestOptions.headers,
+			body: payloadString,
+			json: true,
+		});
 		return response;
 	} catch (error: any) {
 		// Enhanced error handling for AWS API responses
@@ -167,7 +61,7 @@ async function makeAthenaRequest(
 		if (error.response) {
 			statusCode = error.response.statusCode || error.response.status || 'Unknown';
 			responseBody = error.response.body || error.response.data || 'No response body';
-			
+
 			// Try to parse AWS error response in multiple formats
 			try {
 				let errorBodyStr = '';
@@ -178,7 +72,7 @@ async function makeAthenaRequest(
 				} else {
 					errorBodyStr = String(responseBody);
 				}
-				
+
 				if (errorBodyStr) {
 					// Try parsing as JSON first
 					try {
@@ -201,7 +95,7 @@ async function makeAthenaRequest(
 			} catch (parseError) {
 				awsErrorMessage = `Parse error: ${parseError.message}`;
 			}
-			
+
 			errorMessage = `AWS Athena API Error (${statusCode}): ${awsErrorCode} - ${awsErrorMessage}`;
 		} else if (error.message) {
 			errorMessage = `Request Error: ${error.message}`;
@@ -217,7 +111,7 @@ async function makeAthenaRequest(
 			awsErrorCode,
 			awsErrorMessage,
 			responseBody,
-			requestHeaders: signedHeaders,
+			requestHeaders: requestOptions.headers,
 			originalError: error.message,
 			errorType: error.constructor.name,
 		};
@@ -238,63 +132,175 @@ async function makeAthenaRequest(
 }
 
 /**
- * Get temporary credentials from AWS environment (EC2/ECS/EKS)
+ * Get temporary credentials from AWS environment following the AWS credential chain.
+ * Attempts to get credentials in the following order:
+ * 1. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
+ * 2. EKS Pod Identity (AWS_CONTAINER_CREDENTIALS_FULL_URI)
+ * 3. ECS/Fargate container metadata (AWS_CONTAINER_CREDENTIALS_RELATIVE_URI)
+ * 4. EC2 instance metadata service (IMDSv2/IMDSv1)
+ *
+ * Based on n8n's system-credentials-utils.ts implementation
  */
-async function getSystemCredentials(
-	executeFunctions: IExecuteFunctions,
-): Promise<{ accessKeyId: string; secretAccessKey: string; sessionToken: string }> {
-	try {
-		// Try ECS Task Metadata Service first
-		const ecsUri = process.env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI;
-		if (ecsUri) {
-			const response = (await executeFunctions.helpers.httpRequest({
-				method: 'GET',
-				url: `${ECS_METADATA_URI}${ecsUri}`,
-				timeout: METADATA_REQUEST_TIMEOUT,
-				json: true,
-			})) as any;
+async function getSystemCredentials(): Promise<{
+	accessKeyId: string;
+	secretAccessKey: string;
+	sessionToken?: string;
+}> {
+	// 1. Try environment variables
+	const envCreds = getEnvironmentCredentials();
+	if (envCreds) return envCreds;
 
-			return {
-				accessKeyId: response.AccessKeyId,
-				secretAccessKey: response.SecretAccessKey,
-				sessionToken: response.Token,
-			};
+	// 2. Try EKS Pod Identity
+	const podCreds = await getPodIdentityCredentials();
+	if (podCreds) return podCreds;
+
+	// 3. Try ECS/Fargate container metadata
+	const containerCreds = await getContainerMetadataCredentials();
+	if (containerCreds) return containerCreds;
+
+	// 4. Try EC2 instance metadata
+	const instanceCreds = await getInstanceMetadataCredentials();
+	if (instanceCreds) return instanceCreds;
+
+	throw new Error(
+		'No AWS credentials found. Ensure running in AWS (EC2/ECS/EKS) with IAM role or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables.',
+	);
+}
+
+function getEnvironmentCredentials() {
+	const accessKeyId = process.env.AWS_ACCESS_KEY_ID;
+	const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
+	const sessionToken = process.env.AWS_SESSION_TOKEN;
+
+	if (accessKeyId && secretAccessKey) {
+		return {
+			accessKeyId: accessKeyId.trim(),
+			secretAccessKey: secretAccessKey.trim(),
+			sessionToken: sessionToken?.trim(),
+		};
+	}
+
+	return null;
+}
+
+async function getPodIdentityCredentials() {
+	const fullUri = process.env.AWS_CONTAINER_CREDENTIALS_FULL_URI;
+	if (!fullUri) return null;
+
+	try {
+		const authToken = process.env.AWS_CONTAINER_AUTHORIZATION_TOKEN;
+		const headers: Record<string, string> = { 'User-Agent': 'n8n-aws-athena' };
+
+		if (authToken) {
+			headers.Authorization = `Bearer ${authToken}`;
 		}
 
-		// Try EC2 Instance Metadata Service v2 (IMDSv2)
-		const token = (await executeFunctions.helpers.httpRequest({
-			method: 'PUT',
-			url: `${EC2_METADATA_URI}/latest/api/token`,
-			headers: { 'X-aws-ec2-metadata-token-ttl-seconds': '21600' },
-			timeout: METADATA_REQUEST_TIMEOUT,
-		})) as string;
-
-		const roleName = (await executeFunctions.helpers.httpRequest({
+		const response = await fetch(fullUri, {
 			method: 'GET',
-			url: `${EC2_METADATA_URI}/latest/meta-data/iam/security-credentials/`,
-			headers: { 'X-aws-ec2-metadata-token': token },
-			timeout: METADATA_REQUEST_TIMEOUT,
-		})) as string;
+			headers,
+			signal: AbortSignal.timeout(2000),
+		});
 
-		const credentials = (await executeFunctions.helpers.httpRequest({
+		if (!response.ok) return null;
+
+		const data = await response.json() as { AccessKeyId: string; SecretAccessKey: string; Token: string };
+		return {
+			accessKeyId: data.AccessKeyId,
+			secretAccessKey: data.SecretAccessKey,
+			sessionToken: data.Token,
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function getContainerMetadataCredentials() {
+	const relativeUri = process.env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI;
+	if (!relativeUri) return null;
+
+	try {
+		const authToken = process.env.AWS_CONTAINER_AUTHORIZATION_TOKEN;
+		const headers: Record<string, string> = { 'User-Agent': 'n8n-aws-athena' };
+
+		if (authToken) {
+			headers.Authorization = `Bearer ${authToken}`;
+		}
+
+		const response = await fetch(`http://169.254.170.2${relativeUri}`, {
 			method: 'GET',
-			url: `${EC2_METADATA_URI}/latest/meta-data/iam/security-credentials/${roleName.trim()}`,
-			headers: { 'X-aws-ec2-metadata-token': token },
-			timeout: METADATA_REQUEST_TIMEOUT,
-			json: true,
-		})) as any;
+			headers,
+			signal: AbortSignal.timeout(2000),
+		});
+
+		if (!response.ok) return null;
+
+		const data = await response.json() as { AccessKeyId: string; SecretAccessKey: string; Token: string };
+		return {
+			accessKeyId: data.AccessKeyId,
+			secretAccessKey: data.SecretAccessKey,
+			sessionToken: data.Token,
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function getInstanceMetadataCredentials() {
+	try {
+		const baseUrl = 'http://169.254.169.254/latest';
+		const headers: Record<string, string> = { 'User-Agent': 'n8n-aws-athena' };
+
+		// Try to obtain an IMDSv2 token
+		try {
+			const tokenResponse = await fetch(`${baseUrl}/api/token`, {
+				method: 'PUT',
+				headers: {
+					'X-aws-ec2-metadata-token-ttl-seconds': '21600',
+					'User-Agent': 'n8n-aws-athena',
+				},
+				signal: AbortSignal.timeout(2000),
+			});
+
+			if (tokenResponse.ok) {
+				const token = await tokenResponse.text();
+				headers['X-aws-ec2-metadata-token'] = token;
+			}
+		} catch {
+			// IMDSv2 may be disabled; continue with IMDSv1
+		}
+
+		const roleResponse = await fetch(`${baseUrl}/meta-data/iam/security-credentials/`, {
+			method: 'GET',
+			headers,
+			signal: AbortSignal.timeout(2000),
+		});
+
+		if (!roleResponse.ok) return null;
+
+		const roleName = (await roleResponse.text()).trim();
+		if (!roleName) return null;
+
+		const credsResponse = await fetch(
+			`${baseUrl}/meta-data/iam/security-credentials/${roleName}`,
+			{
+				method: 'GET',
+				headers,
+				signal: AbortSignal.timeout(2000),
+			},
+		);
+
+		if (!credsResponse.ok) return null;
+
+		const data = await credsResponse.json() as { AccessKeyId?: string; SecretAccessKey?: string; Token?: string };
+		if (!data?.AccessKeyId || !data?.SecretAccessKey) return null;
 
 		return {
-			accessKeyId: credentials.AccessKeyId,
-			secretAccessKey: credentials.SecretAccessKey,
-			sessionToken: credentials.Token,
+			accessKeyId: data.AccessKeyId,
+			secretAccessKey: data.SecretAccessKey,
+			sessionToken: data.Token,
 		};
-	} catch (error: any) {
-		throw new NodeOperationError(
-			executeFunctions.getNode(),
-			`Failed to retrieve system credentials: ${error.message}. ` +
-				'Ensure n8n is running in AWS (EC2/ECS/EKS) with an IAM role attached.',
-		);
+	} catch {
+		return null;
 	}
 }
 
@@ -324,38 +330,43 @@ async function callStsAssumeRole(
 
 	const domain = region.startsWith('cn-') ? 'amazonaws.com.cn' : 'amazonaws.com';
 	const stsEndpoint = `https://sts.${region}.${domain}/`;
-	const payload = params.toString();
+	const body = params.toString();
 
-	const stsSigner = new AWSSignatureV4(
-		stsAccessKeyId,
-		stsSecretAccessKey,
+	// Construct request options for aws4 signing
+	const requestOptions = {
+		host: `sts.${region}.${domain}`,
+		method: 'POST',
+		path: '/',
+		body,
 		region,
-		'sts',
-		stsSessionToken,
-	);
-
-	const signedHeaders = stsSigner.sign(
-		'POST',
-		stsEndpoint,
-		{
+		service: 'sts',
+		headers: {
 			'Content-Type': 'application/x-www-form-urlencoded',
-			Host: `sts.${region}.${domain}`,
 		},
-		payload,
-	);
+	};
+
+	// Use aws4 to sign the request
+	sign(requestOptions, {
+		accessKeyId: stsAccessKeyId,
+		secretAccessKey: stsSecretAccessKey,
+		sessionToken: stsSessionToken,
+	});
 
 	try {
 		const response = (await executeFunctions.helpers.httpRequest({
 			method: 'POST',
 			url: stsEndpoint,
-			headers: signedHeaders,
-			body: payload,
+			headers: requestOptions.headers,
+			body,
 		})) as any;
 
 		const credentials = response.AssumeRoleResponse?.AssumeRoleResult?.Credentials;
 
 		if (!credentials?.AccessKeyId || !credentials?.SecretAccessKey || !credentials?.SessionToken) {
-			throw new Error('Invalid STS response: missing credentials');
+			throw new NodeOperationError(
+				executeFunctions.getNode(),
+				'Invalid STS response: missing credentials',
+			);
 		}
 
 		return {
@@ -399,7 +410,7 @@ async function getAwsCredentials(
 	const creds = await executeFunctions.getCredentials('awsAssumeRole');
 
 	const { accessKeyId, secretAccessKey, sessionToken } = creds.useSystemCredentialsForRole
-		? await getSystemCredentials(executeFunctions)
+		? await getSystemCredentials()
 		: {
 				accessKeyId: creds.stsAccessKeyId as string,
 				secretAccessKey: creds.stsSecretAccessKey as string,
@@ -429,8 +440,8 @@ export class AwsAthenaQuery implements INodeType {
 		defaults: {
 			name: 'AWS Athena Query',
 		},
-		inputs: ['main'],
-		outputs: ['main'],
+		inputs: [NodeConnectionType.Main],
+		outputs: [NodeConnectionType.Main],
 		usableAsTool: true,
 		credentials: [
 			{
